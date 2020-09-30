@@ -413,7 +413,7 @@ static int stop(struct wpan_driver_context *context)
 
 static void wpan_send_packet(struct wpan_driver_context *context, struct net_pkt *pkt, uint8_t address)
 {
-	LOG_DBG("Send %d byte packet to %02x (%d avail)", net_pkt_get_len(pkt), address, net_pkt_available_buffer(pkt));
+	LOG_DBG("Send %d byte packet to %02x (%d avail) (%d rem)", net_pkt_get_len(pkt), address, net_pkt_available_buffer(pkt), net_pkt_remaining_data(pkt));
 	net_pkt_hexdump(context->pkt, "send WPAN");
 	net_pkt_unref(pkt);
 }
@@ -423,8 +423,8 @@ static int tx(struct wpan_driver_context *context, uint8_t seq, uint16_t len)
 	int retries = 3;
 	int ret;
 
-	LOG_DBG("len %d seq %u plen: %d rem: %d data:0x%02X", 
-		len, seq, net_pkt_get_len(context->pkt), net_pkt_remaining_data(context->pkt), *context->pkt->buffer->data);
+	LOG_DBG("len %d seq %u plen: %d rem: %d", 
+		len, seq, net_pkt_get_len(context->pkt), net_pkt_remaining_data(context->pkt));
 
 	net_pkt_hexdump(context->pkt, "tx");
 
@@ -435,7 +435,7 @@ static int tx(struct wpan_driver_context *context, uint8_t seq, uint16_t len)
 	if (ret) {
 		LOG_ERR("Error sending data, seq %u", seq);
 		/* Send seq = 0 for unsuccessful send */
-		seq = 0U;
+		//seq = 0U; //skip failures for now
 	}
 
 	net_pkt_set_overwrite(context->pkt, true); 
@@ -646,14 +646,16 @@ static void wpan_process_frame(struct wpan_driver_context *context)
 		if(net_pkt_get_len(context->pkt) > 3 && context->crc == 0xf0b8) {
 			uint8_t address = net_buf_pull_u8(context->pkt->buffer);
 			uint8_t ctrl = net_buf_pull_u8(context->pkt->buffer);
-			net_buf_frag_last(context->pkt->buffer)->len -= 2; //drop crc, only works with single buf
+			//net_buf_frag_last(context->pkt->buffer)->len -= 2; //drop crc, only works with single buf
+			net_pkt_update_length(context->pkt, net_pkt_get_len(context->pkt)-2);
+			net_pkt_cursor_init(context->pkt);
 			// buf = net_buf_frag_last(pkt->buffer);
 			// //net_pkt_hexdump(pkt, "<");
 			// packet_address = net_buf_pull_u8(buf);
 			// packet_type = net_buf_pull_u8(buf);
 			//buf->len -= 2; //drop CRC
 
-			net_pkt_cursor_init(context->pkt);
+			//net_pkt_cursor_init(context->pkt);
 			//net_pkt_set_overwrite(context->pkt, true);
 
 			if(address == ADDRESS_CTRL && net_pkt_get_len(context->pkt) > 7) {
