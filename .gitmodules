@@ -1,0 +1,3 @@
+[submodule "boards/arm/beagle_connect"]
+	path = boards/arm/beagle_connect
+	url = https://github.com/statropy/beagle_connect_zephyr_board
