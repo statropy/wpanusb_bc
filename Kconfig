@@ -1,7 +1,51 @@
-# Copyright (c) 2020 PHYTEC Messtechnik GmbH
+# Private config options for BeagleConnect wpanusb app
+
+# Copyright (c) 2020 Erik Larson
 # SPDX-License-Identifier: Apache-2.0
 
-#config USB_DEVICE_PID
-#	default USB_PID_WPANUSB_SAMPLE
+mainmenu "BeagleConnect wpanusb application"
+
+config WPAN_TX_STACK_SIZE
+	int "Stack size for sending packets to host"
+	default 1024
+	help
+	  Stack size for sending packets to host.
+
+config WPANUSB_UART_BUF_LEN
+	int "Buffer size for pulling bytes from the UART RX interrupt"
+	default 8
+	help
+	  Buffer size for pulling bytes from the UART RX interrupt.
+
+config WPANUSB_RINGBUF_SIZE
+	int "Size of the ringbuffer for parsing commands from UART RX"
+	default 256
+	help
+	  Size of the ringbuffer for parsing commands from UART RX.
+
+config WPANUSB_RX_PRIORITY
+	int "Priority of the work queue task for processing UART RX messages"
+	default 7
+	help
+	  Priority of the work queue task for processing UART RX messages.
+
+config WPANUSB_RX_STACK_SIZE
+	int "Stack size of the work queue task for processing UART RX messages"
+	default 768
+	help
+	  Stack size of the work queue task for processing UART RX messages.
+
+config WPANUSB_NET_BUF_SIZE
+	int "Size of net_buf used for UART RX/TX commands"
+	default 136
+	help
+	  Size of net_buf used for UART RX/TX commands.
+
+config WPANUSB_UART_NAME
+	string "UART device name for communication with the host"
+	default "UART_0"
+	help
+	  UART device name for communication with the host.
+
 
 source "Kconfig.zephyr"

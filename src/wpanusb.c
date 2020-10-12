@@ -7,7 +7,7 @@
 
 #define LOG_LEVEL CONFIG_USB_DEVICE_LOG_LEVEL
 #include <logging/log.h>
-LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_INF);
 
 #include <net/buf.h>
 #include <net/ieee802154_radio.h>
@@ -29,40 +29,7 @@ LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_DBG);
 #define HDLC_ESC_FRAME  0x5E
 #define HDLC_ESC_ESC    0x5D
 
-#ifndef CONFIG_WPAN_TX_STACK_SIZE
-#define CONFIG_WPAN_TX_STACK_SIZE 1024
-#endif
-
-#ifndef CONFIG_WPANUSB_UART_BUF_LEN
-#define CONFIG_WPANUSB_UART_BUF_LEN 8
-#endif
-
-#ifndef CONFIG_WPANUSB_RINGBUF_SIZE
-#define CONFIG_WPANUSB_RINGBUF_SIZE 256
-#endif
-
-#ifndef CONFIG_WPANUSB_RX_PRIORITY
-#define CONFIG_WPANUSB_RX_PRIORITY 7
-#endif
-
-#ifndef CONFIG_WPANUSB_RX_STACK_SIZE
-#define CONFIG_WPANUSB_RX_STACK_SIZE 768
-#endif
-
-#ifndef CONFIG_WPANUSB_NET_BUF_SIZE
-#define CONFIG_WPANUSB_NET_BUF_SIZE 256
-#endif
-
-#ifndef CONFIG_WPANUSB_UART_NAME
-#define CONFIG_WPANUSB_UART_NAME "UART_1"
-#endif
-
-#define UART_BUF_LEN CONFIG_WPANUSB_UART_BUF_LEN
-
-#define WPAN_WORKQ_PRIORITY CONFIG_WPANUSB_RX_PRIORITY
-#define WPAN_WORKQ_STACK_SIZE CONFIG_WPANUSB_RX_STACK_SIZE
-
-K_KERNEL_STACK_DEFINE(wpan_workq, WPAN_WORKQ_STACK_SIZE);
+K_KERNEL_STACK_DEFINE(wpan_workq, CONFIG_WPANUSB_RX_STACK_SIZE);
 K_THREAD_STACK_DEFINE(tx_stack, CONFIG_WPAN_TX_STACK_SIZE);
 
 struct wpan_driver_context {
@@ -79,7 +46,7 @@ struct wpan_driver_context {
 	size_t available;
 
 	/* ppp data is read into this buf */
-	uint8_t buf[UART_BUF_LEN];
+	uint8_t buf[CONFIG_WPANUSB_UART_BUF_LEN];
 
 	/* Incoming data is routed via ring buffer */
 	struct ring_buf rx_ringbuf;
@@ -112,22 +79,22 @@ static int set_channel(struct wpan_driver_context *wpan)
 	wpan->channel.channel = req->channel;
 	LOG_DBG("page %u channel %u", wpan->channel.page, wpan->channel.channel);
 
-	return 0;
-
-	//return wpan->radio_api->set_channel(wpan->ieee802154_dev, req->channel);
+	return wpan->radio_api->set_channel(wpan->ieee802154_dev, req->channel);
 }
 
 static int set_ieee_addr(struct wpan_driver_context *wpan)
 {
 	struct set_ieee_addr *req = net_buf_pull_mem(wpan->pkt->buffer, sizeof(struct set_ieee_addr));
 
-	LOG_DBG("%016llX", req->ieee_addr);
-
 	if (IEEE802154_HW_FILTER &
 		wpan->radio_api->get_capabilities(wpan->ieee802154_dev)) {
 		struct ieee802154_filter filter;
 
 		filter.ieee_addr = (uint8_t *)&req->ieee_addr;
+
+		LOG_DBG("%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x", 
+			filter.ieee_addr[0], filter.ieee_addr[1], filter.ieee_addr[2], filter.ieee_addr[3], 
+			filter.ieee_addr[4], filter.ieee_addr[5], filter.ieee_addr[6], filter.ieee_addr[7]);
 
 		return wpan->radio_api->filter(wpan->ieee802154_dev, true,
 					 IEEE802154_FILTER_TYPE_IEEE_ADDR,
@@ -213,7 +180,7 @@ static void tx_thread(void *p1)
 	while(1) {
 		pkt = k_fifo_get(&wpan->tx_queue, K_FOREVER);
 		LOG_DBG("%d byte (%d avail) (%d rem)", net_pkt_get_len(pkt), net_pkt_available_buffer(pkt), net_pkt_remaining_data(pkt));
-		net_pkt_hexdump(pkt, "tx thread");
+		//net_pkt_hexdump(pkt, "tx thread");
 
 #ifdef WPAN_APPEND_ADDRESS
 		net_pkt_set_overwrite(pkt, true); //overwrite must be true otherwise the buffer length is doubled by skip??????
@@ -271,22 +238,42 @@ static int tx(struct wpan_driver_context *wpan, uint8_t seq, uint16_t len)
 {
 	int retries = 3;
 	int ret;
+	struct net_buf *frag = wpan->pkt->buffer;
+	struct net_buf frame_buf = {
+		.data = wpan->tx_buf,
+		.size = IEEE802154_MTU + 2,
+		.frags = NULL,
+		.len = len,
+		.__buf = wpan->tx_buf,
+	};
 
 	LOG_DBG("len %d seq %u plen: %d rem: %d", 
 		len, seq, net_pkt_get_len(wpan->pkt), net_pkt_remaining_data(wpan->pkt));
 
+	//net_pkt_print_buffer_info(wpan->pkt, "tx frags");
+
 	net_pkt_hexdump(wpan->pkt, "tx");
 
+	if(wpan->pkt->buffer->len < len) {
+		LOG_DBG("BUFFER USES MULTIPLE FRAGMENTS!!!");
+
+		for(int i=0;i<len;i++) {
+			net_pkt_read_u8(wpan->pkt, &wpan->tx_buf[i]);
+		}
+		frag = &frame_buf;
+	}
+
 	do {
-		ret = wpan->radio_api->tx(wpan->ieee802154_dev, IEEE802154_TX_MODE_CSMA_CA, wpan->pkt, wpan->pkt->buffer);
+		ret = wpan->radio_api->tx(wpan->ieee802154_dev, IEEE802154_TX_MODE_CSMA_CA, wpan->pkt, frag);
 	} while (ret && retries--);
 
 	if (ret) {
 		LOG_ERR("Error sending data, seq %u", seq);
 		/* Send seq = 0 for unsuccessful send */
-		//seq = 0U; //skip failures for now
+		seq = 0U;
 	}
 	net_pkt_update_length(wpan->pkt, 0);
+	net_pkt_cursor_init(wpan->pkt);
 	net_pkt_write_u8(wpan->pkt, seq);
 	net_pkt_cursor_init(wpan->pkt);
 
@@ -317,6 +304,7 @@ int net_recv_data(struct net_if *iface, struct net_pkt *rx_pkt)
 
 	LOG_DBG("Got data, pkt %p, len %d, avail: %d", rx_pkt, len, net_pkt_available_buffer(rx_pkt));
 
+	//net_pkt_print_buffer_info(rx_pkt, "rx frags");
 	net_pkt_hexdump(rx_pkt, "rx");
 
 	pkt = net_pkt_rx_alloc_with_buffer(NULL, CONFIG_WPANUSB_NET_BUF_SIZE, AF_UNSPEC, 0, K_NO_WAIT);
@@ -332,8 +320,8 @@ int net_recv_data(struct net_if *iface, struct net_pkt *rx_pkt)
 		uint8_t byte = net_buf_pull_u8(rx_pkt->buffer);
 		net_pkt_write_u8(pkt, byte);
 	}
-	uint8_t lqi = net_pkt_ieee802154_lqi(rx_pkt);
-	net_pkt_write_u8(pkt, lqi);
+
+	net_pkt_write_u8(pkt, net_pkt_ieee802154_lqi(rx_pkt));
 	net_pkt_cursor_init(pkt);
 
 	net_pkt_unref(rx_pkt);
@@ -599,7 +587,7 @@ void main(void)
 
 	k_work_q_start(&wpan->cb_workq, wpan_workq,
 				K_KERNEL_STACK_SIZEOF(wpan_workq),
-				K_PRIO_COOP(WPAN_WORKQ_PRIORITY));
+				K_PRIO_COOP(CONFIG_WPANUSB_RX_PRIORITY));
 	k_thread_name_set(&wpan->cb_workq.thread, "wpan_workq");
 
 	wpan->pkt = NULL;
