@@ -76,7 +76,7 @@ static int set_channel(struct wpan_driver_context *wpan)
 	struct set_channel *req = net_buf_pull_mem(wpan->pkt->buffer, sizeof(struct set_channel));
 
 	wpan->channel.page = req->page;
-	wpan->channel.channel = req->channel;
+	wpan->channel.channel = 1;//req->channel;
 	LOG_DBG("page %u channel %u", wpan->channel.page, wpan->channel.channel);
 
 	return wpan->radio_api->set_channel(wpan->ieee802154_dev, req->channel);
