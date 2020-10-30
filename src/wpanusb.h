@@ -2,6 +2,7 @@
  * Copyright (c) 2016-2019 Intel Corporation
  *
  * SPDX-License-Identifier: Apache-2.0
+ * Modifications Copyright (c) 2020 Erik Larson
  */
 
 enum wpanusb_requests {
