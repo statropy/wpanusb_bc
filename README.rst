@@ -1,6 +1,6 @@
-.. _wpanusb-sample:
+.. wpanusb_bc:
 
-wpanusb sample for Beagle Connect
+wpanusb for Beagle Connect
 ##############
 
 Overview
@@ -19,28 +19,50 @@ Requirements
 - wpanusb Linux kernel driver (in the process of being open sourced)
 - wpan-tools (available for all Linux distributions)
 
-Building and Running
-********************
+Building
+********
 
-Build the wpanusb sample for a board:
-
-.. zephyr-app-commands::
-   :zephyr-app: wpanusb-bc
-   :board: beagle-connect
-   :goals: build
-   :compact:
-
-The following script enables the network interface in Linux
-(uses iwpan tool from above):
+Clone and update the submodule for the BeagleConnect board definition
 
 .. code-block:: console
 
-    #!/bin/sh
-    PHY=`iwpan phy | grep wpan_phy | cut -d' ' -f2`
-    echo 'Using phy' $PHY
-    iwpan dev wpan0 set pan_id 0xabcd
-    iwpan dev wpan0 set short_addr 0xbeef
-    iwpan phy $PHY set channel 0 26
-    ip link add link wpan0 name lowpan0 type lowpan
-    ip link set wpan0 up
-    ip link set lowpan0 up
+    cd ~
+    git clone https://github.com/statropy/wpanusb_bc
+    cd wpanusb_bc
+    git submodule init
+    git submodule update
+    cd <zephyr root>
+
+Build the wpanusb_bc project for 2.4GHz:
+
+.. code-block:: console
+
+    west build -b beagle_connect ~/wpanusb_bc
+
+Or build the wpanusb_bc project for Sub GHz:
+
+.. code-block:: console
+
+    west build -b beagle_connect ~/wpanusb_bc -- -DOVERLAY_CONFIG=overlay-subghz.conf
+
+A build directory can be specified with the -d option
+
+Updating with west flash
+************************
+
+To program the BeagleConnect with west flash the MSP430 needs to be loaded with the 
+master branch of https://github.com/statropy/msp430F55xx_usb_uart_bridge. See 
+https://github.com/statropy/msp430F55xx_usb_uart_bridge/blob/master/README.md for
+instructions on building and programming the MSP430.
+
+Then to flash the CC1352 with the wpanusb_bc program:
+
+.. code-block:: console
+    west flash
+
+Now update the MSP430 again, this time with the wpan_endpoint branch. Checkout that 
+branch and follow the same programming instructions. This allows the wpanusb_bc program 
+to communicate with the linux host.
+
+The linux host needs the wpanusb kernel module, clone and follow the instructions at
+https://github.com/statropy/wpanusb
