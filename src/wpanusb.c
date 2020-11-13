@@ -17,6 +17,8 @@ LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_INF);
 #include <sys/crc.h>
 #include <drivers/uart.h>
 #include <drivers/console/uart_mux.h>
+#include <device.h>
+#include <init.h>
 
 #include "wpanusb.h"
 
@@ -310,7 +312,7 @@ int net_recv_data(struct net_if *iface, struct net_pkt *rx_pkt)
 	pkt = net_pkt_rx_alloc_with_buffer(NULL, CONFIG_WPANUSB_NET_BUF_SIZE, AF_UNSPEC, 0, K_NO_WAIT);
 	if (!pkt) {
 		LOG_ERR("cannot allocate pkt");
-		net_pkt_unref(rx_pkt);
+		//net_pkt_unref(rx_pkt);
 		return -ENOMEM;
 	}
 
@@ -379,7 +381,7 @@ static void wpan_process_ctrl_frame(struct wpan_driver_context *wpan)
 		break;
 	}
 
-	if(ret != 0) {
+	if (ret != 0) {
 		LOG_ERR("Command 0x%02x failed: (%d)", cmd, ret);
 	}
 
@@ -388,15 +390,17 @@ static void wpan_process_ctrl_frame(struct wpan_driver_context *wpan)
 
 static void wpan_process_frame(struct wpan_driver_context *wpan)
 {
-	if(wpan->pkt) {
-		if(net_pkt_get_len(wpan->pkt) > 3 && wpan->crc == 0xf0b8) {
+	if (wpan->pkt) {
+		if (net_pkt_get_len(wpan->pkt) > 3 && wpan->crc == 0xf0b8) {
 			uint8_t address = net_buf_pull_u8(wpan->pkt->buffer);
 			uint8_t ctrl = net_buf_pull_u8(wpan->pkt->buffer);
 			net_pkt_update_length(wpan->pkt, net_pkt_get_len(wpan->pkt)-2);
 			net_pkt_cursor_init(wpan->pkt);
 
-			if(address == ADDRESS_CTRL && net_pkt_get_len(wpan->pkt) > 7) {
+			if (address == ADDRESS_CTRL && net_pkt_get_len(wpan->pkt) > 7) {
 				wpan_process_ctrl_frame(wpan);
+			} else if (address ==ADDRESS_CDC) {
+
 			} else {
 				LOG_ERR("Dropped HDLC addr:%x ctrl:%x", address, ctrl);
 				net_pkt_hexdump(wpan->pkt, "<");
@@ -598,3 +602,100 @@ void main(void)
 
 	LOG_DBG("radio_api %p initialized", wpan->radio_api);
 }
+
+#if defined(CONFIG_PRINTK) || defined(CONFIG_STDOUT_CONSOLE)
+
+static int console_out(int c)
+{
+	static struct net_pkt *pkt = NULL;
+	
+	if (!pkt) {
+		pkt = net_pkt_rx_alloc_with_buffer(NULL, CONFIG_WPANUSB_NET_BUF_SIZE, AF_UNSPEC, 0, K_NO_WAIT);
+		if (!pkt) {
+			return -ENOMEM;
+		}
+	} 
+
+	int send = false;
+	int cr_lf = false;
+	int len = net_pkt_get_len(pkt);
+
+	if ('\n' == c)
+	{
+		send = true;
+		if (len >= CONFIG_WPANUSB_NET_BUF_SIZE-3) {
+			cr_lf = true;
+		} else {
+			net_pkt_write_u8(pkt, '\r');
+			net_pkt_write_u8(pkt, '\n');
+		}
+	} else {
+		net_pkt_write_u8(pkt, c);
+		if (len >= CONFIG_WPANUSB_NET_BUF_SIZE-2) {
+			send = true;
+		}
+	}
+
+	if (send) {
+		net_pkt_cursor_init(pkt);
+		wpan_send_packet(&wpan_context_data, pkt, ADDRESS_CDC);
+		pkt = NULL;
+
+		if (cr_lf) {
+			pkt = net_pkt_rx_alloc_with_buffer(NULL, CONFIG_WPANUSB_NET_BUF_SIZE, AF_UNSPEC, 0, K_NO_WAIT);
+			if (pkt) {
+				net_pkt_write_u8(pkt, '\r');
+				net_pkt_write_u8(pkt, '\n');
+				net_pkt_cursor_init(pkt);
+				wpan_send_packet(&wpan_context_data, pkt, ADDRESS_CDC);
+				pkt = NULL;
+			}
+		}
+	}
+
+	return c;
+}
+#endif
+
+#if defined(CONFIG_STDOUT_CONSOLE)
+extern void __stdout_hook_install(int (*hook)(int));
+#else
+#define __stdout_hook_install(x)		\
+	do {/* nothing */			\
+	} while ((0))
+#endif
+
+#if defined(CONFIG_PRINTK)
+extern void __printk_hook_install(int (*fn)(int));
+#else
+#define __printk_hook_install(x)		\
+	do {/* nothing */			\
+	} while ((0))
+#endif
+
+/**
+ * @brief Install printk/stdout hook for console output
+ * @return N/A
+ */
+static void wpanusb_console_hook_install(void)
+{
+	__stdout_hook_install(console_out);
+	__printk_hook_install(console_out);
+}
+
+/**
+ * @brief Initialize the console/debug port
+ * @return 0 if successful, otherwise failed.
+ */
+static int wpanusb_console_init(const struct device *arg)
+{
+	ARG_UNUSED(arg);
+	wpanusb_console_hook_install();
+	return 0;
+}
+
+/* UART console initializes after the UART device itself */
+SYS_INIT(wpanusb_console_init,
+	 APPLICATION,
+	 95);//CONFIG_WPANUSB_CONSOLE_INIT_PRIORITY);
+/* TODO Add Kconfig for priority */
