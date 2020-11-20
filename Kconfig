@@ -19,7 +19,7 @@ config WPANUSB_UART_BUF_LEN
 
 config WPANUSB_RINGBUF_SIZE
 	int "Size of the ringbuffer for parsing commands from UART RX"
-	default 256
+	default 1024
 	help
 	  Size of the ringbuffer for parsing commands from UART RX.
 
@@ -47,5 +47,14 @@ config WPANUSB_UART_NAME
 	help
 	  UART device name for communication with the host.
 
+config WPANUSB_CONSOLE
+	bool "Use WPANUSB for console"
+	select CONSOLE_HAS_DRIVER
+	help
+	  Enable this option to use WPANUSB for console.
+
+config WPANUSB_HDLC_NUM_BLOCKS
+	int "Number of message blocks to reserve"
+	default 20
 
 source "Kconfig.zephyr"
