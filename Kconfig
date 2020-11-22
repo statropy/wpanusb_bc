@@ -55,6 +55,6 @@ config WPANUSB_CONSOLE
 
 config WPANUSB_HDLC_NUM_BLOCKS
 	int "Number of message blocks to reserve"
-	default 20
+	default 50
 
 source "Kconfig.zephyr"

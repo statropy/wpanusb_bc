@@ -72,7 +72,8 @@ struct wpan_driver_context {
 	struct ieee802154_radio_api *radio_api;
 	const struct device *ieee802154_dev;
 
-	struct hdlc_block *rx_hdlc_block;
+	uint8_t rx_buffer_len;
+	uint8_t rx_buffer[HDLC_BUFFER_SIZE];
 	struct hdlc_block *tx_hdlc_block;
 
 	/* ppp data is read into this buf */
@@ -102,19 +103,19 @@ static struct wpan_driver_context wpan_context_data;
 
 static int set_channel(struct wpan_driver_context *wpan)
 {
-	struct set_channel *req = (struct set_channel *)&wpan->rx_hdlc_block->buffer[10];
+	struct set_channel *req = (struct set_channel *)&wpan->rx_buffer[10];
 
 	wpan->channel.page = req->page;
 	wpan->channel.channel = req->channel;
 	LOG_DBG("page %u channel %u", wpan->channel.page, wpan->channel.channel);
-	printk("page %u channel %u\n", wpan->channel.page, wpan->channel.channel);
+	//printk("page %u channel %u\n", wpan->channel.page, wpan->channel.channel);
 
 	return wpan->radio_api->set_channel(wpan->ieee802154_dev, req->channel);
 }
 
 static int set_ieee_addr(struct wpan_driver_context *wpan)
 {
-	struct set_ieee_addr *req = (struct set_ieee_addr *)&wpan->rx_hdlc_block->buffer[10];
+	struct set_ieee_addr *req = (struct set_ieee_addr *)&wpan->rx_buffer[10];
 
 	if (IEEE802154_HW_FILTER &
 		wpan->radio_api->get_capabilities(wpan->ieee802154_dev)) {
@@ -125,9 +126,9 @@ static int set_ieee_addr(struct wpan_driver_context *wpan)
 		LOG_DBG("%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x", 
 			filter.ieee_addr[0], filter.ieee_addr[1], filter.ieee_addr[2], filter.ieee_addr[3], 
 			filter.ieee_addr[4], filter.ieee_addr[5], filter.ieee_addr[6], filter.ieee_addr[7]);
-		printk("%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n", 
-			filter.ieee_addr[0], filter.ieee_addr[1], filter.ieee_addr[2], filter.ieee_addr[3], 
-			filter.ieee_addr[4], filter.ieee_addr[5], filter.ieee_addr[6], filter.ieee_addr[7]);
+		// printk("%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n", 
+		// 	filter.ieee_addr[0], filter.ieee_addr[1], filter.ieee_addr[2], filter.ieee_addr[3], 
+		// 	filter.ieee_addr[4], filter.ieee_addr[5], filter.ieee_addr[6], filter.ieee_addr[7]);
 
 		return wpan->radio_api->filter(wpan->ieee802154_dev, true,
 					 IEEE802154_FILTER_TYPE_IEEE_ADDR,
@@ -139,10 +140,10 @@ static int set_ieee_addr(struct wpan_driver_context *wpan)
 
 static int set_short_addr(struct wpan_driver_context *wpan)
 {
-	struct set_short_addr *req = (struct set_short_addr *)&wpan->rx_hdlc_block->buffer[10];
+	struct set_short_addr *req = (struct set_short_addr *)&wpan->rx_buffer[10];
 
 	LOG_DBG("%04X", req->short_addr);
-	printk("Short %04X\n", req->short_addr);
+	//printk("Short %04X\n", req->short_addr);
 
 	if (IEEE802154_HW_FILTER &
 		wpan->radio_api->get_capabilities(wpan->ieee802154_dev)) {
@@ -160,10 +161,10 @@ static int set_short_addr(struct wpan_driver_context *wpan)
 
 static int set_pan_id(struct wpan_driver_context *wpan)
 {
-	struct set_pan_id *req = (struct set_pan_id *)&wpan->rx_hdlc_block->buffer[10];
+	struct set_pan_id *req = (struct set_pan_id *)&wpan->rx_buffer[10];
 	
 	LOG_DBG("%04X", req->pan_id);
-	printk("PAN %04X\n", req->pan_id);
+	//printk("PAN %04X\n", req->pan_id);
 
 	if (IEEE802154_HW_FILTER &
 		wpan->radio_api->get_capabilities(wpan->ieee802154_dev)) {
@@ -182,7 +183,7 @@ static int set_pan_id(struct wpan_driver_context *wpan)
 static int start(struct wpan_driver_context *wpan)
 {
 	LOG_INF("Start IEEE 802.15.4 device");
-	printk("Start IEEE 802.15.4 device\n");
+	//printk("Start IEEE 802.15.4 device\n");
 	int ret = wpan->radio_api->set_channel(wpan->ieee802154_dev, wpan->channel.channel);
 	if(ret == 0) {
 		return wpan->radio_api->start(wpan->ieee802154_dev);
@@ -193,7 +194,7 @@ static int start(struct wpan_driver_context *wpan)
 static int stop(struct wpan_driver_context *wpan)
 {
 	LOG_INF("Stop IEEE 802.15.4 device");
-	printk("Stop IEEE 802.15.4 device\n");
+	//printk("Stop IEEE 802.15.4 device\n");
 
 	return wpan->radio_api->stop(wpan->ieee802154_dev);
 }
@@ -236,38 +237,67 @@ static void tx_thread(void *p1)
 	while(1) {
 		block_ptr = k_fifo_get(&wpan->tx_queue, K_FOREVER);
 		if (!block_ptr) {
+			LOG_ERR("FIFO Get Error");
 			continue;
 		}
 
-		if ((uint32_t)block_ptr->fifo_reserved) {
-			debug_block.length = sprintf(debug_block.buffer, "ERR: %d|%d txq: %p, len: %d\r\n", 
-				k_mem_slab_num_used_get(&hdlc_slab), k_mem_slab_num_free_get(&hdlc_slab),
-				block_ptr->fifo_reserved, block_ptr->length);
-			block_out(wpan, &debug_block);
-		}
+		uint32_t num_used = k_mem_slab_num_used_get(&hdlc_slab);
+
+		// debug_block.length = sprintf(debug_block.buffer, "< %d %d|%d txq: %p, p: %p, len: %d\r\n", 
+		// 	block_ptr->address,
+		// 	num_used, k_mem_slab_num_free_get(&hdlc_slab),
+		// 	block_ptr->fifo_reserved,
+		// 	block_ptr, block_ptr->length);
+		// block_out(wpan, &debug_block);
 		
 		block_out(wpan, block_ptr);
 
-		if (k_mem_slab_num_used_get(&hdlc_slab) <= 0) {
+		//TODO: ACK Semaphore?
+		k_msleep(5);
+
+		if (num_used > CONFIG_WPANUSB_HDLC_NUM_BLOCKS) {
+			LOG_ERR("SUSPENDED!");
+			// debug_block.length = sprintf(debug_block.buffer, "SUSPENDED!!!\r\n");
+			// block_out(wpan, &debug_block);
 			k_thread_suspend(k_current_get());
 		}
 
-		k_mem_slab_free(&hdlc_slab, (void **) &block_ptr);
+		if (block_ptr) {
+			LOG_DBG("Free  %s: %p, u: %d len: %d", block_ptr->length == 1 ? "TX" : "RX",
+				block_ptr, k_mem_slab_num_used_get(&hdlc_slab), block_ptr->length);
+
+			// if (block_ptr->address != ADDRESS_CDC) {
+			// 	printk("Free  %s: %p, u: %d len: %d\n", block_ptr->length == 1 ? "TX" : "RX",
+			// 		block_ptr, k_mem_slab_num_used_get(&hdlc_slab), block_ptr->length);
+			// }
+			block_ptr->length = 0; //0-out before free
+			k_mem_slab_free(&hdlc_slab, (void **) &block_ptr);
+		} else {
+			// debug_block.length = sprintf(debug_block.buffer, "TX can't free block!\r\n");
+			// block_out(wpan, &debug_block);
+			LOG_ERR("Can't free block!!!");
+		}
+		
 		//k_msleep(10);
 	}
 }
 
-static int tx(struct wpan_driver_context *wpan, uint8_t seq, uint16_t len)
+static int tx(struct wpan_driver_context *wpan)
 {
+	uint16_t index = (wpan->rx_buffer[7] << 8) | wpan->rx_buffer[6];
+	uint16_t length = (wpan->rx_buffer[9] << 8) | wpan->rx_buffer[8];
+	uint8_t *buf = &wpan->rx_buffer[10];
 	int retries = 3;
 	int ret;
 	struct net_buf frag = {
-		.data = &wpan->rx_hdlc_block->buffer[10],
+		.data = buf,
 		.size = IEEE802154_MTU + 2,
 		.frags = NULL,
-		.len = len,
-		.__buf = &wpan->rx_hdlc_block->buffer[10],
+		.len = length,
+		.__buf = buf,
 	};
+	struct hdlc_block *block_ptr;
+	uint8_t seq = (uint8_t)index;
 
 	do {
 		ret = wpan->radio_api->tx(wpan->ieee802154_dev, IEEE802154_TX_MODE_CSMA_CA, NULL, &frag);
@@ -275,22 +305,37 @@ static int tx(struct wpan_driver_context *wpan, uint8_t seq, uint16_t len)
 
 	if (ret) {
 		LOG_ERR("Error sending data, seq %u", seq);
-		printk("Error sending data, seq %u\n", seq);
+		//printk("Error sending data, seq %u\n", seq);
 		/* Send seq = 0 for unsuccessful send */
 		seq = 0U;
 	}
-	LOG_HEXDUMP_DBG(&wpan->rx_hdlc_block->buffer[10], len, "TX");
+	LOG_HEXDUMP_DBG(buf, length, "TX");
 
-	wpan->rx_hdlc_block->buffer[0] = seq;
-	wpan->rx_hdlc_block->length = 1;
-	wpan->rx_hdlc_block->address = ADDRESS_WPAN;
+	if (k_mem_slab_alloc(&hdlc_slab, (void**)&block_ptr, K_NO_WAIT)) {
+		if (dev_led1) {
+			gpio_pin_set(dev_led1, PIN1, 1);
+		}
+		LOG_ERR("TX No Mem");
+		//printk("TX No Mem\n");
+		return -ENOMEM;
+	}
 
-	LOG_DBG("Sent Data: Seq:%d Len:%d", seq, len);
-	printk("Sent Data: Seq:%d Len:%d\n", seq, len);
+	LOG_DBG("Alloc TX: %p, u: %d len: 1 (%d)", block_ptr, 
+		k_mem_slab_num_used_get(&hdlc_slab), block_ptr->length);
 
-	k_fifo_put(&wpan->tx_queue, wpan->rx_hdlc_block);
+	printk("TX: %02X %d\n", seq, length);
 
-	wpan->rx_hdlc_block = NULL;
+	// printk("Alloc TX: %p, u: %d len: 1 (%d)\n", block_ptr, 
+	// 	k_mem_slab_num_used_get(&hdlc_slab), block_ptr->length);
+	
+	block_ptr->buffer[0] = seq;
+	block_ptr->length = 1;
+	block_ptr->address = ADDRESS_WPAN;
+
+	// LOG_DBG("Sent Data: Seq:%d Len:%d", seq, length);
+	// printk("Sent Data: Seq:%d Len:%d\n", seq, length);
+
+	k_fifo_put(&wpan->tx_queue, block_ptr);
 
 	return ret;
 }
@@ -304,8 +349,8 @@ static void init_tx_queue(struct wpan_driver_context *wpan)
 			K_THREAD_STACK_SIZEOF(tx_stack),
 			(k_thread_entry_t)tx_thread,
 			wpan, NULL, NULL, K_PRIO_COOP(8), 0, K_FOREVER);
-	k_thread_access_grant(&wpan->tx_thread_data, &wpan->tx_queue,
-			      &hdlc_slab, &wpan);
+	// k_thread_access_grant(&wpan->tx_thread_data, &wpan->tx_queue,
+	// 		      &hdlc_slab, &wpan);
 	k_thread_start(&wpan->tx_thread_data);
 }
 
@@ -318,16 +363,17 @@ int net_recv_data(struct net_if *iface, struct net_pkt *rx_pkt)
 	struct hdlc_block *block_ptr;
 	struct wpan_driver_context *wpan = &wpan_context_data;
 	size_t len = net_pkt_get_len(rx_pkt);
+	static uint8_t seq = 1;
 
 	gpio_pin_toggle(dev_led2, PIN2);
 
 	LOG_DBG("Got data, pkt %p, len %d", rx_pkt, len);
-	printk("GOT data, pkt %p, len %d ", rx_pkt, len);
+	//printk("GOT data, pkt %p, len %d ", rx_pkt, len);
 
 	/* len + packet + lqi */
 	if (len + 2 > HDLC_BUFFER_SIZE) {
 		LOG_ERR("RX TOO BIG");
-		printk("RX TOO BIG\n");
+		//printk("RX TOO BIG\n");
 		return -ENOMEM;
 	}
 
@@ -336,16 +382,24 @@ int net_recv_data(struct net_if *iface, struct net_pkt *rx_pkt)
 			gpio_pin_set(dev_led1, PIN1, 1);
 		}
 		LOG_ERR("RX No Mem");
-		printk("RX No Mem\n");
+		//printk("RX No Mem\n");
 		return -ENOMEM;
 	}
 
-	block_ptr->length = 0;
+	//block_ptr->length = 0;
 	block_ptr->address = ADDRESS_WPAN;
 
-	printk("RX Block: %p, used: %d free: %d\n", block_ptr, 
-		k_mem_slab_num_used_get(&hdlc_slab), k_mem_slab_num_free_get(&hdlc_slab));
+	LOG_DBG("Alloc RX: %p, u: %d len: %d (%d)", block_ptr, 
+		k_mem_slab_num_used_get(&hdlc_slab), len+2, block_ptr->length);
 
+	printk("RX: %02X %d\n", seq, len-2); //exclude FCS because MAC layer drops it for wireshark
+	seq++;
+	if (!seq) {
+		seq = 1;
+	}
+
+	// printk("Alloc RX: %p, u: %d len: %d (%d)\n", block_ptr, 
+	// 	k_mem_slab_num_used_get(&hdlc_slab), len+2, block_ptr->length);
 	//pre-pend packet length, post-pend LQI
 	block_ptr->length = len + 2;
 	block_ptr->buffer[0] = len;
@@ -363,20 +417,20 @@ int net_recv_data(struct net_if *iface, struct net_pkt *rx_pkt)
 static void wpan_process_ctrl_frame(struct wpan_driver_context *wpan)
 {
 	int ret = 0;
-	uint8_t *buf = wpan->rx_hdlc_block->buffer;
-	uint8_t cmd = buf[3];
-	//uint16_t value = (buf[4] << 8) | buf[5];
-	uint16_t index = (buf[7] << 8) | buf[6];
-	uint16_t length = (buf[9] << 8) | buf[8];
+	// uint8_t *buf = wpan->rx_buffer;
+	uint8_t cmd = wpan->rx_buffer[3];
+	// //uint16_t value = (buf[4] << 8) | buf[5];
+	// uint16_t index = (buf[7] << 8) | buf[6];
+	// uint16_t length = (buf[9] << 8) | buf[8];
 
 	switch (cmd) {
 	case RESET:
 		LOG_DBG("Reset device");
-		printk("Reset device\n");
+		//printk("Reset device\n");
 		break;
 	case TX:
-		tx(wpan, (uint8_t)index, length);
-		return;
+		ret = tx(wpan);
+		break;
 	case START:
 		ret = start(wpan);
 		break;
@@ -397,73 +451,67 @@ static void wpan_process_ctrl_frame(struct wpan_driver_context *wpan)
 		break;
 	default:
 		LOG_ERR("%x: Not handled for now", cmd);
-		printk("%x: Not handled for now\n", cmd);
+		//printk("%x: Not handled for now\n", cmd);
 		break;
 	}
 
 	if (ret != 0) {
 		LOG_ERR("Command 0x%02x failed: (%d)", cmd, ret);
-		printk("Command 0x%02x failed: (%d)\n", cmd, ret);
+		//printk("Command 0x%02x failed: (%d)\n", cmd, ret);
 	}
-
-	//LOG_DBG("Free %04x", (uint32_t)wpan->rx_hdlc_block);
-
-	k_mem_slab_free(&hdlc_slab, (void**) &wpan->rx_hdlc_block);
-	wpan->rx_hdlc_block = NULL;
 }
 
 static void wpan_process_frame(struct wpan_driver_context *wpan)
 {
-	if (wpan->rx_hdlc_block) {
-		if(wpan->rx_hdlc_block->buffer[0] == 0xEE) {
-			LOG_HEXDUMP_ERR(wpan->rx_hdlc_block->buffer, wpan->rx_hdlc_block->length, "MSP430 ERROR");
-			printk("MSP430 ERROR\n");
-			k_mem_slab_free(&hdlc_slab, (void **) &wpan->rx_hdlc_block); //just in case
-		}
-		else if (wpan->rx_hdlc_block->length > 3 && wpan->crc == 0xf0b8) {
-			uint8_t address = wpan->rx_hdlc_block->buffer[0];
-			uint8_t ctrl = wpan->rx_hdlc_block->buffer[1];
-
-			if (address == ADDRESS_CTRL && wpan->rx_hdlc_block->length > 9) {
-				wpan_process_ctrl_frame(wpan);
-			} else if (address == ADDRESS_CDC) {
-				k_mem_slab_free(&hdlc_slab, (void **) &wpan->rx_hdlc_block); //just in case
-			} else {
-				LOG_ERR("Dropped HDLC addr:%x ctrl:%x", address, ctrl);
-				printk("Dropped HDLC addr:%x ctrl:%x\n", address, ctrl);
-				LOG_HEXDUMP_DBG(wpan->rx_hdlc_block->buffer, wpan->rx_hdlc_block->length, "rx_hdlc_block");
-				k_mem_slab_free(&hdlc_slab, (void **) &wpan->rx_hdlc_block);
-			}
-		} else {
-			LOG_ERR("Dropped HDLC crc:%04x len:%d", wpan->crc, wpan->rx_hdlc_block->length);
-			printk("Dropped HDLC crc:%04x len:%d\n", wpan->crc, wpan->rx_hdlc_block->length);
-			k_mem_slab_free(&hdlc_slab, (void **) &wpan->rx_hdlc_block);
-		}
+	if(wpan->rx_buffer[0] == 0xEE) {
+		LOG_HEXDUMP_ERR(wpan->rx_buffer, 8, "MSP430 ERROR");
+		//printk("MSP430 ERROR\n");
 	}
+	else if (wpan->rx_buffer_len > 3 && wpan->crc == 0xf0b8) {
+		uint8_t address = wpan->rx_buffer[0];
+		uint8_t ctrl = wpan->rx_buffer[1];
+
+		if (address == ADDRESS_CTRL && wpan->rx_buffer_len > 9) {
+			wpan_process_ctrl_frame(wpan);
+		} else if (address == ADDRESS_CDC) {
+			//printk("Ignore CDC Frame\n");
+			LOG_WRN("Ignore CDC Frame");
+		} else {
+			LOG_ERR("Dropped HDLC addr:%x ctrl:%x", address, ctrl);
+			//printk("Dropped HDLC addr:%x ctrl:%x\n", address, ctrl);
+			LOG_HEXDUMP_DBG(wpan->rx_buffer, wpan->rx_buffer_len, "rx_buffer");
+		}
+	} else {
+		LOG_ERR("Dropped HDLC crc:%04x len:%d", wpan->crc, wpan->rx_buffer_len);
+		//printk("Dropped HDLC crc:%04x len:%d\n", wpan->crc, wpan->rx_buffer_len);
+	}
+
 	wpan->crc = 0xffff;
-	wpan->rx_hdlc_block = NULL;
+	wpan->rx_buffer_len = 0;
 }
 
 static int wpan_save_byte(struct wpan_driver_context *wpan, uint8_t byte)
 {
-	if (!wpan->rx_hdlc_block) {
-		if (k_mem_slab_alloc(&hdlc_slab, (void *) &wpan->rx_hdlc_block, K_NO_WAIT)) {
-			if (dev_led1) {
-				gpio_pin_set(dev_led1, PIN1, 1);
-			}
-			wpan->rx_hdlc_block = NULL;
-			return -ENOMEM;
-		}
-		wpan->rx_hdlc_block->length = 0;
-		//LOG_DBG("Alloc %p", wpan->rx_hdlc_block);
+	// if (!wpan->rx_hdlc_block) {
+	// 	if (k_mem_slab_alloc(&hdlc_slab, (void *) &wpan->rx_hdlc_block, K_NO_WAIT)) {
+	// 		if (dev_led1) {
+	// 			gpio_pin_set(dev_led1, PIN1, 1);
+	// 		}
+	// 		wpan->rx_hdlc_block = NULL;
+	// 		return -ENOMEM;
+	// 	}
+	// 	wpan->rx_hdlc_block->length = 0;
+	// 	//LOG_DBG("Alloc %p", wpan->rx_hdlc_block);
+	// }
+
+	if (wpan->rx_buffer_len >= HDLC_BUFFER_SIZE) {
+		//printk("HDLC RX Buffer Overflow\n");
+		LOG_ERR("HDLC RX Buffer Overflow");
+		wpan->crc = 0xffff;
+		wpan->rx_buffer_len = 0;
 	}
 
-	if (wpan->rx_hdlc_block->length >= HDLC_BUFFER_SIZE) {
-		printk("HDLC RX Buffer Overflow\n");
-		wpan->rx_hdlc_block->length = 0;
-	}
-
-	wpan->rx_hdlc_block->buffer[wpan->rx_hdlc_block->length++] = byte;
+	wpan->rx_buffer[wpan->rx_buffer_len++] = byte;
 
 	return 0;
 }
@@ -471,7 +519,9 @@ static int wpan_save_byte(struct wpan_driver_context *wpan, uint8_t byte)
 static void wpan_input_byte(struct wpan_driver_context *wpan, uint8_t byte)
 {
 	if(byte == HDLC_FRAME) {
-		wpan_process_frame(wpan);
+		if (wpan->rx_buffer_len) {
+			wpan_process_frame(wpan);
+		}
 	} else {
 		if(byte == HDLC_ESC) {
 			wpan->next_escaped = true;
@@ -514,7 +564,7 @@ static int wpan_consume_ringbuf(struct wpan_driver_context *wpan)
 
 	ret = ring_buf_get_finish(&wpan->rx_ringbuf, len);
 	if (ret < 0) {
-		LOG_DBG("Cannot flush ring buffer (%d)", ret);
+		LOG_ERR("Cannot flush ring buffer (%d)", ret);
 	}
 
 	return -EAGAIN;
@@ -610,12 +660,12 @@ void main(void)
 	LOG_DBG("radio_api %p initialized", wpan->radio_api);
 	printk("radio_api %p initialized\n", wpan->radio_api);
 
-	while (1) {
-		k_msleep(5000);
-		//wpanusb_console_out(1);
-		printk("C:%u B:%d\n", isr_count, k_mem_slab_num_used_get(&hdlc_slab));
-		//LOG_ERR("Test1");
-	}
+	// while (1) {
+	// 	k_msleep(5000);
+	// 	//wpanusb_console_out(1);
+	// 	printk("C:%u B:%d\n", isr_count, k_mem_slab_num_used_get(&hdlc_slab));
+	// 	//LOG_ERR("Test1");
+	// }
 }
 
 #if defined(CONFIG_PRINTK) || defined(CONFIG_STDOUT_CONSOLE)
