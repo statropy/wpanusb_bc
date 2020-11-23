@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2016-2019 Intel Corporation
+ * Copyright (c) 2020 Statropy Software LLC
  *
  * SPDX-License-Identifier: Apache-2.0
- * Modifications Copyright (c) 2020 Erik Larson
  */
 
 #define LOG_LEVEL CONFIG_USB_DEVICE_LOG_LEVEL
 #include <logging/log.h>
-LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_WRN);
 
 #include <net/buf.h>
 #include <net/ieee802154_radio.h>
@@ -16,7 +16,24 @@ LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_INF);
 #include <sys/ring_buffer.h>
 #include <sys/crc.h>
 #include <drivers/uart.h>
-#include <drivers/console/uart_mux.h>
+#include <device.h>
+#include <init.h>
+#include <drivers/gpio.h>
+
+#include <stdio.h>
+
+#define LED0_NODE DT_ALIAS(led0)
+#define LED0	DT_GPIO_LABEL(LED0_NODE, gpios)
+#define PIN0	DT_GPIO_PIN(LED0_NODE, gpios)
+#define FLAGS0	DT_GPIO_FLAGS(LED0_NODE, gpios)
+
+#define LED1_NODE DT_ALIAS(led1)
+#define LED1	DT_GPIO_LABEL(LED1_NODE, gpios)
+#define PIN1	DT_GPIO_PIN(LED1_NODE, gpios)
+#define FLAGS1	DT_GPIO_FLAGS(LED1_NODE, gpios)
+
+static const struct device *dev_led0;
+static const struct device *dev_led1;
 
 #include "wpanusb.h"
 
@@ -29,21 +46,30 @@ LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_INF);
 #define HDLC_ESC_FRAME  0x5E
 #define HDLC_ESC_ESC    0x5D
 
+#define HDLC_BUFFER_SIZE 140
+
+struct hdlc_block {
+	void *fifo_reserved;
+	uint8_t address;
+	uint8_t length;
+	uint8_t buffer[HDLC_BUFFER_SIZE];
+};
+
 K_KERNEL_STACK_DEFINE(wpan_workq, CONFIG_WPANUSB_RX_STACK_SIZE);
 K_THREAD_STACK_DEFINE(tx_stack, CONFIG_WPAN_TX_STACK_SIZE);
+K_MEM_SLAB_DEFINE(hdlc_slab, sizeof(struct hdlc_block), CONFIG_WPANUSB_HDLC_NUM_BLOCKS, 4);
+K_SEM_DEFINE(hdlc_sem, 0, 1);
+
 
 struct wpan_driver_context {
 	const struct device *uart_dev;
-	//struct net_if *iface;
 
 	struct ieee802154_radio_api *radio_api;
 	const struct device *ieee802154_dev;
 
-	/* This net_pkt contains pkt that is being read */
-	struct net_pkt *pkt;
-
-	/* How much free space we have in the net_pkt */
-	size_t available;
+	uint8_t rx_buffer_len;
+	uint8_t rx_buffer[HDLC_BUFFER_SIZE];
+	struct hdlc_block *tx_hdlc_block;
 
 	/* ppp data is read into this buf */
 	uint8_t buf[CONFIG_WPANUSB_UART_BUF_LEN];
@@ -58,13 +84,15 @@ struct wpan_driver_context {
 
 	struct k_thread tx_thread_data;
 	struct k_fifo tx_queue;
-	uint8_t tx_buf[IEEE802154_MTU + 1 + 1];
 
 	uint16_t crc;
 
 	struct set_channel channel;
 
 	uint8_t next_escaped;
+
+	uint8_t hdlc_send_seq;
+	uint8_t hdlc_rx_send_seq;
 };
 
 static struct wpan_driver_context wpan_context_data;
@@ -73,7 +101,7 @@ static struct wpan_driver_context wpan_context_data;
 
 static int set_channel(struct wpan_driver_context *wpan)
 {
-	struct set_channel *req = net_buf_pull_mem(wpan->pkt->buffer, sizeof(struct set_channel));
+	struct set_channel *req = (struct set_channel *)&wpan->rx_buffer[10];
 
 	wpan->channel.page = req->page;
 	wpan->channel.channel = req->channel;
@@ -84,7 +112,7 @@ static int set_channel(struct wpan_driver_context *wpan)
 
 static int set_ieee_addr(struct wpan_driver_context *wpan)
 {
-	struct set_ieee_addr *req = net_buf_pull_mem(wpan->pkt->buffer, sizeof(struct set_ieee_addr));
+	struct set_ieee_addr *req = (struct set_ieee_addr *)&wpan->rx_buffer[10];
 
 	if (IEEE802154_HW_FILTER &
 		wpan->radio_api->get_capabilities(wpan->ieee802154_dev)) {
@@ -106,7 +134,7 @@ static int set_ieee_addr(struct wpan_driver_context *wpan)
 
 static int set_short_addr(struct wpan_driver_context *wpan)
 {
-	struct set_short_addr *req = net_buf_pull_mem(wpan->pkt->buffer, sizeof(struct set_short_addr));
+	struct set_short_addr *req = (struct set_short_addr *)&wpan->rx_buffer[10];
 
 	LOG_DBG("%04X", req->short_addr);
 
@@ -126,8 +154,8 @@ static int set_short_addr(struct wpan_driver_context *wpan)
 
 static int set_pan_id(struct wpan_driver_context *wpan)
 {
-	struct set_pan_id *req = net_buf_pull_mem(wpan->pkt->buffer, sizeof(struct set_pan_id));
-
+	struct set_pan_id *req = (struct set_pan_id *)&wpan->rx_buffer[10];
+	
 	LOG_DBG("%04X", req->pan_id);
 
 	if (IEEE802154_HW_FILTER &
@@ -157,7 +185,6 @@ static int start(struct wpan_driver_context *wpan)
 static int stop(struct wpan_driver_context *wpan)
 {
 	LOG_INF("Stop IEEE 802.15.4 device");
-
 	return wpan->radio_api->stop(wpan->ieee802154_dev);
 }
 
@@ -171,113 +198,125 @@ static void uart_poll_out_crc(const struct device *dev, uint8_t byte, uint16_t *
 	uart_poll_out(dev, byte);
 }
 
+static void block_out(struct wpan_driver_context *wpan, struct hdlc_block *block_ptr)
+{
+	uint16_t crc = 0xffff;
+
+	uart_poll_out(wpan->uart_dev, HDLC_FRAME);
+	uart_poll_out_crc(wpan->uart_dev, block_ptr->address, &crc);
+	
+	if (block_ptr->address == ADDRESS_WPAN) {
+		uart_poll_out_crc(wpan->uart_dev, wpan->hdlc_send_seq << 1, &crc);
+	} else {
+		uart_poll_out_crc(wpan->uart_dev, 0x03, &crc);
+	}
+	
+	for(int i=0; i<block_ptr->length; i++) {
+		uart_poll_out_crc(wpan->uart_dev, block_ptr->buffer[i], &crc);
+	}
+
+	uint16_t crc_calc = crc ^ 0xffff;
+	uart_poll_out_crc(wpan->uart_dev, crc_calc, &crc);
+	uart_poll_out_crc(wpan->uart_dev, crc_calc >> 8, &crc);
+	uart_poll_out(wpan->uart_dev, HDLC_FRAME);
+}
+
 static void tx_thread(void *p1)
 {
 	struct wpan_driver_context *wpan = p1;
-	struct net_pkt *pkt;
-	uint8_t address;
+	struct hdlc_block *block_ptr;
+	struct hdlc_block debug_block;
+
+	debug_block.address = ADDRESS_CDC;
 
 	while(1) {
-		pkt = k_fifo_get(&wpan->tx_queue, K_FOREVER);
-		LOG_DBG("%d byte (%d avail) (%d rem)", net_pkt_get_len(pkt), net_pkt_available_buffer(pkt), net_pkt_remaining_data(pkt));
-		//net_pkt_hexdump(pkt, "tx thread");
-
-#ifdef WPAN_APPEND_ADDRESS
-		net_pkt_set_overwrite(pkt, true); //overwrite must be true otherwise the buffer length is doubled by skip??????
-		net_pkt_skip(pkt, net_pkt_get_len(pkt)-1); //Skip to last byte in buffer
-		net_pkt_set_overwrite(pkt, false); //overwrite must be false here, otherwise data doesn't get written
-		net_pkt_read_u8(pkt, &address); //write to end of packet
-		net_pkt_update_length(pkt, net_pkt_get_len(pkt)-1);
-		net_pkt_cursor_init(pkt); //reset cursor
-#else
-		address = pkt->priority;
-#endif
-
-		uint16_t crc = 0xffff;
-
-		uart_poll_out(wpan->uart_dev, HDLC_FRAME);
-		uart_poll_out_crc(wpan->uart_dev, address, &crc);
-		uart_poll_out_crc(wpan->uart_dev, 0x03, &crc);
-		for(int i=0; i<net_pkt_get_len(pkt); i++) {
-			uint8_t byte;
-			net_pkt_read_u8(pkt, &byte);
-			uart_poll_out_crc(wpan->uart_dev, byte, &crc);
+		block_ptr = k_fifo_get(&wpan->tx_queue, K_FOREVER);
+		if (!block_ptr) {
+			LOG_ERR("FIFO Get Error");
+			continue;
 		}
 
-		uint16_t crc_calc = crc ^ 0xffff;
-		uart_poll_out_crc(wpan->uart_dev, crc_calc, &crc);
-		uart_poll_out_crc(wpan->uart_dev, crc_calc >> 8, &crc);
-		uart_poll_out(wpan->uart_dev, HDLC_FRAME);
+		uint8_t block_pending = 0;
+		int retries = 0;
+		int wait_time = 15;
 
-		LOG_DBG("CRC:%04x Check:%04x", crc_calc, crc);
-		//assert crc_calc == 0xf0b8?
+		do {
+			block_out(wpan, block_ptr);
 
-		net_pkt_unref(pkt);
+			if (block_ptr->address == ADDRESS_WPAN) {
+				if (k_sem_take(&hdlc_sem, K_MSEC(wait_time))) {
+					if (retries++ < 3) {
+						LOG_DBG("I-Frame Retry");
+						wait_time += 5;
+						block_pending = 1;
+					} else if (wpan->hdlc_rx_send_seq == ((wpan->hdlc_send_seq + 1) & 0x07)) {
+						LOG_DBG("I-Frame Seq Retry");
+						wait_time += 5;
+						block_pending = 1;
+					} else {
+						LOG_ERR("No ACK, Drop Packet");
+					}
+				} else {
+					wpan->hdlc_rx_send_seq = (wpan->hdlc_rx_send_seq + 1) & 0x07;
+				}
+			}
+		} while (block_pending);
+
+		k_mem_slab_free(&hdlc_slab, (void **) &block_ptr);
 	}
 }
 
-static void wpan_send_packet(struct wpan_driver_context *wpan, struct net_pkt *pkt, uint8_t address)
+static int tx(struct wpan_driver_context *wpan)
 {
-	LOG_DBG("%d byte packet to %02x (%d avail) (%d rem)", net_pkt_get_len(pkt), address, net_pkt_available_buffer(pkt), net_pkt_remaining_data(pkt));
-	//net_pkt_hexdump(pkt, "send WPAN");
-
-#ifdef WPAN_APPEND_ADDRESS
-	net_pkt_set_overwrite(pkt, true); //overwrite must be true otherwise the buffer length is doubled by skip??????
-	net_pkt_skip(pkt, net_pkt_get_len(pkt)); //Skip to end-of-buffer
-	net_pkt_set_overwrite(pkt, false); //overwrite must be false here, otherwise data doesn't get written
-	net_pkt_write_u8(pkt, address); //write to end of packet
-	net_pkt_cursor_init(pkt); //reset cursor
-#else
-	pkt->priority = address;
-#endif
-
-	k_fifo_put(&wpan->tx_queue, pkt);
-}
-
-static int tx(struct wpan_driver_context *wpan, uint8_t seq, uint16_t len)
-{
+	uint16_t index = (wpan->rx_buffer[7] << 8) | wpan->rx_buffer[6];
+	uint16_t length = (wpan->rx_buffer[9] << 8) | wpan->rx_buffer[8];
+	uint8_t *buf = &wpan->rx_buffer[10];
 	int retries = 3;
 	int ret;
-	struct net_buf *frag = wpan->pkt->buffer;
-	struct net_buf frame_buf = {
-		.data = wpan->tx_buf,
+	struct net_buf frag = {
+		.data = buf,
 		.size = IEEE802154_MTU + 2,
 		.frags = NULL,
-		.len = len,
-		.__buf = wpan->tx_buf,
+		.len = length,
+		.__buf = buf,
 	};
+	struct hdlc_block *block_ptr;
+	uint8_t seq = (uint8_t)index;
 
-	LOG_DBG("len %d seq %u plen: %d rem: %d", 
-		len, seq, net_pkt_get_len(wpan->pkt), net_pkt_remaining_data(wpan->pkt));
-
-	//net_pkt_print_buffer_info(wpan->pkt, "tx frags");
-
-	net_pkt_hexdump(wpan->pkt, "tx");
-
-	if(wpan->pkt->buffer->len < len) {
-		LOG_DBG("BUFFER USES MULTIPLE FRAGMENTS!!!");
-
-		for(int i=0;i<len;i++) {
-			net_pkt_read_u8(wpan->pkt, &wpan->tx_buf[i]);
-		}
-		frag = &frame_buf;
+	if (dev_led0) {
+		gpio_pin_set(dev_led0, PIN0, 1);
 	}
 
 	do {
-		ret = wpan->radio_api->tx(wpan->ieee802154_dev, IEEE802154_TX_MODE_CSMA_CA, wpan->pkt, frag);
+		ret = wpan->radio_api->tx(wpan->ieee802154_dev, IEEE802154_TX_MODE_CSMA_CA, NULL, &frag);
 	} while (ret && retries--);
+
+	if (dev_led0) {
+		gpio_pin_set(dev_led0, PIN0, 0);
+	}
 
 	if (ret) {
 		LOG_ERR("Error sending data, seq %u", seq);
-		/* Send seq = 0 for unsuccessful send */
 		seq = 0U;
 	}
-	net_pkt_update_length(wpan->pkt, 0);
-	net_pkt_cursor_init(wpan->pkt);
-	net_pkt_write_u8(wpan->pkt, seq);
-	net_pkt_cursor_init(wpan->pkt);
 
-	wpan_send_packet(wpan, wpan->pkt, ADDRESS_WPAN);
+	LOG_HEXDUMP_DBG(buf, length, "TX");
+
+	if (k_mem_slab_alloc(&hdlc_slab, (void**)&block_ptr, K_NO_WAIT)) {
+		LOG_ERR("TX No Mem");
+		return -ENOMEM;
+	}
+
+	LOG_DBG("Alloc TX: %p, u: %d len: 1 (%d)", block_ptr, 
+		k_mem_slab_num_used_get(&hdlc_slab), block_ptr->length);
+
+	printk("TX: %d\n", length);
+	
+	block_ptr->buffer[0] = seq;
+	block_ptr->length = 1;
+	block_ptr->address = ADDRESS_WPAN;
+
+	k_fifo_put(&wpan->tx_queue, block_ptr);
 
 	return ret;
 }
@@ -290,7 +329,9 @@ static void init_tx_queue(struct wpan_driver_context *wpan)
 	k_thread_create(&wpan->tx_thread_data, tx_stack,
 			K_THREAD_STACK_SIZEOF(tx_stack),
 			(k_thread_entry_t)tx_thread,
-			wpan, NULL, NULL, K_PRIO_COOP(8), 0, K_NO_WAIT);
+			wpan, NULL, NULL, K_PRIO_COOP(8), 0, K_FOREVER);
+	k_thread_name_set(&wpan->tx_thread_data, "wpan_hdlc_tx");
+	k_thread_start(&wpan->tx_thread_data);
 }
 
 /**
@@ -299,63 +340,69 @@ static void init_tx_queue(struct wpan_driver_context *wpan)
  */
 int net_recv_data(struct net_if *iface, struct net_pkt *rx_pkt)
 {
-	struct net_pkt *pkt;
+	struct hdlc_block *block_ptr;
+	struct wpan_driver_context *wpan = &wpan_context_data;
 	size_t len = net_pkt_get_len(rx_pkt);
 
-	LOG_DBG("Got data, pkt %p, len %d, avail: %d", rx_pkt, len, net_pkt_available_buffer(rx_pkt));
+	LOG_DBG("Got data, pkt %p, len %d", rx_pkt, len);
 
-	//net_pkt_print_buffer_info(rx_pkt, "rx frags");
-	net_pkt_hexdump(rx_pkt, "rx");
-
-	pkt = net_pkt_rx_alloc_with_buffer(NULL, CONFIG_WPANUSB_NET_BUF_SIZE, AF_UNSPEC, 0, K_NO_WAIT);
-	if (!pkt) {
-		LOG_ERR("cannot allocate pkt");
-		net_pkt_unref(rx_pkt);
+	/* len + packet + lqi */
+	if (len + 2 > HDLC_BUFFER_SIZE) {
+		LOG_ERR("RX TOO BIG");
 		return -ENOMEM;
 	}
 
-	//pre-pend packet length, post-pend LQI
-	net_pkt_write_u8(pkt, len);
-	for(int i=0;i<len;i++) {
-		uint8_t byte = net_buf_pull_u8(rx_pkt->buffer);
-		net_pkt_write_u8(pkt, byte);
+	if (k_mem_slab_alloc(&hdlc_slab, (void**)&block_ptr, K_NO_WAIT)) {
+		LOG_ERR("RX No Mem");
+		return -ENOMEM;
 	}
 
-	net_pkt_write_u8(pkt, net_pkt_ieee802154_lqi(rx_pkt));
-	net_pkt_cursor_init(pkt);
+	if (dev_led1) {
+		gpio_pin_set(dev_led1, PIN1, 1);
+	}
+
+	block_ptr->address = ADDRESS_WPAN;
+
+	LOG_DBG("Alloc RX: %p, u: %d len: %d (%d)", block_ptr, 
+		k_mem_slab_num_used_get(&hdlc_slab), len+2, block_ptr->length);
+
+	printk("RX: %d\n", len-2); //exclude FCS because MAC layer drops it for wireshark
+
+	//pre-pend packet length, post-pend LQI
+	block_ptr->length = len + 2;
+	block_ptr->buffer[0] = len;
+	for(int i=1;i<=len;i++) {
+		block_ptr->buffer[i] = net_buf_pull_u8(rx_pkt->buffer);
+	}
+	block_ptr->buffer[len+1] = net_pkt_ieee802154_lqi(rx_pkt);
 
 	net_pkt_unref(rx_pkt);
 
-	wpan_send_packet(&wpan_context_data, pkt, ADDRESS_WPAN);
+	k_fifo_put(&wpan->tx_queue, block_ptr);
+
+	if (dev_led1) {
+		gpio_pin_set(dev_led1, PIN1, 0);
+	}
+
 	return 0;
 }
 
 static void wpan_process_ctrl_frame(struct wpan_driver_context *wpan)
 {
 	int ret = 0;
-	uint8_t cmd;
-	uint16_t value;
-	uint16_t index;
-	uint16_t length;
-
-	net_buf_pull_u8(wpan->pkt->buffer);
-	cmd = net_buf_pull_u8(wpan->pkt->buffer);
-	value = net_buf_pull_le16(wpan->pkt->buffer);
-	index = net_buf_pull_le16(wpan->pkt->buffer);
-	length = net_buf_pull_le16(wpan->pkt->buffer);
-
-	//LOG_DBG("cmd: %x v:%x i:%x l:%x", cmd, value, index, length);
-	//net_pkt_hexdump(wpan->pkt, "<");
-
-	net_pkt_cursor_init(wpan->pkt);
+	// uint8_t *buf = wpan->rx_buffer;
+	uint8_t cmd = wpan->rx_buffer[3];
+	// //uint16_t value = (buf[4] << 8) | buf[5];
+	// uint16_t index = (buf[7] << 8) | buf[6];
+	// uint16_t length = (buf[9] << 8) | buf[8];
 
 	switch (cmd) {
 	case RESET:
 		LOG_DBG("Reset device");
 		break;
 	case TX:
-		tx(wpan, (uint8_t)index, length);
-		return; //DON'T UNREF PKT! Reuse for output
+		ret = tx(wpan);
+		break;
 	case START:
 		ret = start(wpan);
 		break;
@@ -379,114 +426,64 @@ static void wpan_process_ctrl_frame(struct wpan_driver_context *wpan)
 		break;
 	}
 
-	if(ret != 0) {
+	if (ret != 0) {
 		LOG_ERR("Command 0x%02x failed: (%d)", cmd, ret);
 	}
-
-	net_pkt_unref(wpan->pkt);
 }
 
 static void wpan_process_frame(struct wpan_driver_context *wpan)
 {
-	if(wpan->pkt) {
-		if(net_pkt_get_len(wpan->pkt) > 3 && wpan->crc == 0xf0b8) {
-			uint8_t address = net_buf_pull_u8(wpan->pkt->buffer);
-			uint8_t ctrl = net_buf_pull_u8(wpan->pkt->buffer);
-			net_pkt_update_length(wpan->pkt, net_pkt_get_len(wpan->pkt)-2);
-			net_pkt_cursor_init(wpan->pkt);
-
-			if(address == ADDRESS_CTRL && net_pkt_get_len(wpan->pkt) > 7) {
-				wpan_process_ctrl_frame(wpan);
-			} else {
-				LOG_ERR("Dropped HDLC addr:%x ctrl:%x", address, ctrl);
-				net_pkt_hexdump(wpan->pkt, "<");
-				net_pkt_unref(wpan->pkt);
-			}
-		} else {
-			//discard
-			LOG_ERR("Dropped HDLC crc:%04x len:%d", wpan->crc, net_pkt_get_len(wpan->pkt));
-			net_pkt_hexdump(wpan->pkt, "err");
-			net_pkt_unref(wpan->pkt);
-		}
+	if(wpan->rx_buffer[0] == 0xEE) {
+		LOG_HEXDUMP_ERR(wpan->rx_buffer, 8, "HDLC ERROR");
 	}
-	wpan->crc = 0xffff;
-	wpan->pkt = NULL;
-}
+	else if (wpan->rx_buffer_len > 3 && wpan->crc == 0xf0b8) {
+		uint8_t address = wpan->rx_buffer[0];
+		uint8_t ctrl = wpan->rx_buffer[1];
 
+		if ((ctrl & 1) == 0) {
+			wpan->hdlc_rx_send_seq = (ctrl >> 5) & 0x07;
+			k_sem_give(&hdlc_sem);
+		} else if (address == ADDRESS_CTRL && wpan->rx_buffer_len > 9) {
+			wpan_process_ctrl_frame(wpan);
+		} else if (address == ADDRESS_CDC) {
+			LOG_WRN("Ignore CDC Frame");
+		} else {
+			LOG_ERR("Dropped HDLC addr:%x ctrl:%x", address, ctrl);
+			LOG_HEXDUMP_DBG(wpan->rx_buffer, wpan->rx_buffer_len, "rx_buffer");
+		}
+	} else {
+		LOG_ERR("Dropped HDLC crc:%04x len:%d", wpan->crc, wpan->rx_buffer_len);
+	}
+
+	wpan->crc = 0xffff;
+	wpan->rx_buffer_len = 0;
+}
 
 static int wpan_save_byte(struct wpan_driver_context *wpan, uint8_t byte)
 {
-	int ret;
-
-	if (!wpan->pkt) {
-		wpan->pkt = net_pkt_rx_alloc_with_buffer(
-			NULL,
-			CONFIG_WPANUSB_NET_BUF_SIZE,
-			AF_UNSPEC, 0, K_NO_WAIT);
-		if (!wpan->pkt) {
-			LOG_ERR("[%p] cannot allocate pkt", wpan);
-			return -ENOMEM;
-		}
-
-		net_pkt_cursor_init(wpan->pkt);
-
-		wpan->available = net_pkt_available_buffer(wpan->pkt);
+	if (wpan->rx_buffer_len >= HDLC_BUFFER_SIZE) {
+		LOG_ERR("HDLC RX Buffer Overflow");
+		wpan->crc = 0xffff;
+		wpan->rx_buffer_len = 0;
 	}
 
-	/* Extra debugging can be enabled separately if really
-	 * needed. Normally it would just print too much data.
-	 */
-	if (0) {
-		LOG_DBG("Saving byte %02x", byte);
-	}
-
-	/* This is not very intuitive but we must allocate new buffer
-	 * before we write a byte to last available cursor position.
-	 */
-	if (wpan->available == 1) {
-		ret = net_pkt_alloc_buffer(wpan->pkt,
-					   CONFIG_WPANUSB_NET_BUF_SIZE,
-					   AF_UNSPEC, K_NO_WAIT);
-		if (ret < 0) {
-			LOG_ERR("[%p] cannot allocate new data buffer", wpan);
-			goto out_of_mem;
-		}
-
-		wpan->available = net_pkt_available_buffer(wpan->pkt);
-	}
-
-	if (wpan->available) {
-		ret = net_pkt_write_u8(wpan->pkt, byte);
-		if (ret < 0) {
-			LOG_ERR("[%p] Cannot write to pkt %p (%d)",
-				wpan, wpan->pkt, ret);
-			goto out_of_mem;
-		}
-
-		wpan->available--;
-	}
+	wpan->rx_buffer[wpan->rx_buffer_len++] = byte;
 
 	return 0;
-
-out_of_mem:
-	net_pkt_unref(wpan->pkt);
-	wpan->pkt = NULL;
-	return -ENOMEM;
 }
 
 static void wpan_input_byte(struct wpan_driver_context *wpan, uint8_t byte)
 {
 	if(byte == HDLC_FRAME) {
-		wpan_process_frame(wpan);
+		if (wpan->rx_buffer_len) {
+			wpan_process_frame(wpan);
+		}
 	} else {
 		if(byte == HDLC_ESC) {
 			wpan->next_escaped = true;
 		} else {
 			if(wpan->next_escaped) {
-				//TODO assert byte != HDLC_FRAME
-				LOG_DBG("ESC: 0x%02X->", byte);
 				byte ^= 0x20;
-				LOG_DBG("0x%02X", byte);
 				wpan->next_escaped = false;
 			}
 			wpan->crc = crc16_ccitt(wpan->crc, &byte, 1);
@@ -507,11 +504,6 @@ static int wpan_consume_ringbuf(struct wpan_driver_context *wpan)
 		return 0;
 	}
 
-	/* This will print too much data, enable only if really needed */
-	if (0) {
-		LOG_HEXDUMP_DBG(data, len, wpan->uart_dev->name);
-	}
-
 	tmp = len;
 
 	do {
@@ -520,7 +512,7 @@ static int wpan_consume_ringbuf(struct wpan_driver_context *wpan)
 
 	ret = ring_buf_get_finish(&wpan->rx_ringbuf, len);
 	if (ret < 0) {
-		LOG_DBG("Cannot flush ring buffer (%d)", ret);
+		LOG_ERR("Cannot flush ring buffer (%d)", ret);
 	}
 
 	return -EAGAIN;
@@ -564,23 +556,17 @@ static void wpan_isr_uart(const struct device *uart, void *user_data)
 void main(void)
 {
 	struct wpan_driver_context *wpan = &wpan_context_data;
+	dev_led0 = device_get_binding(LED0);
+	dev_led1 = device_get_binding(LED1);
+
+	gpio_pin_configure(dev_led0, PIN0, GPIO_OUTPUT_INACTIVE | FLAGS0);
+	gpio_pin_configure(dev_led1, PIN1, GPIO_OUTPUT_INACTIVE | FLAGS1);
 
 	LOG_INF("Starting wpanusb");
 
-	wpan->ieee802154_dev = device_get_binding(CONFIG_NET_CONFIG_IEEE802154_DEV_NAME);
-	if (!wpan->ieee802154_dev) {
-		LOG_ERR("Cannot get IEEE802.15.4 device");
-		return;
-	}
-
-	/* Initialize net_pkt */
 	net_pkt_init();
 
-	/* Initialize transmit queue */
 	init_tx_queue(wpan);
-
-	wpan->radio_api = (struct ieee802154_radio_api *)wpan->ieee802154_dev->api;
-
 
 	ring_buf_init(&wpan->rx_ringbuf, sizeof(wpan->rx_buf), wpan->rx_buf);
 	k_work_init(&wpan->cb_work, wpan_isr_cb_work);
@@ -590,11 +576,102 @@ void main(void)
 				K_PRIO_COOP(CONFIG_WPANUSB_RX_PRIORITY));
 	k_thread_name_set(&wpan->cb_workq.thread, "wpan_workq");
 
-	wpan->pkt = NULL;
-
-	wpan->uart_dev = device_get_binding(CONFIG_WPANUSB_UART_NAME); //UART_1
+	wpan->uart_dev = device_get_binding(CONFIG_WPANUSB_UART_NAME);
+	if (!wpan->uart_dev) {
+		LOG_ERR("Cannot get UART");
+		return;
+	}
 	uart_irq_callback_user_data_set(wpan->uart_dev, wpan_isr_uart, wpan);
 	uart_irq_rx_enable(wpan->uart_dev);
 
+	wpan->ieee802154_dev = device_get_binding(CONFIG_NET_CONFIG_IEEE802154_DEV_NAME);
+	if (!wpan->ieee802154_dev) {
+		LOG_ERR("Cannot get IEEE802.15.4 device");
+		return;
+	}
+
+	wpan->radio_api = (struct ieee802154_radio_api *)wpan->ieee802154_dev->api;
+
 	LOG_DBG("radio_api %p initialized", wpan->radio_api);
 }
+
+#if defined(CONFIG_PRINTK) || defined(CONFIG_STDOUT_CONSOLE)
+
+extern void __printk_hook_install(int (*fn)(int));
+extern void __stdout_hook_install(int (*fn)(int));
+
+static int wpanusb_console_out(int c)
+{
+	struct wpan_driver_context *wpan = &wpan_context_data;
+
+	if (!wpan->tx_hdlc_block) {
+		if (k_mem_slab_alloc(&hdlc_slab, (void *) &wpan->tx_hdlc_block, K_NO_WAIT)) {
+			wpan->tx_hdlc_block = NULL;
+			return -ENOMEM;
+		} else {
+			wpan->tx_hdlc_block->length = 0;
+			wpan->tx_hdlc_block->address = ADDRESS_CDC;
+		}
+	}
+
+	int send = false;
+	int cr_lf = false;
+	int len = wpan->tx_hdlc_block->length;
+
+	if ('\n' == c)
+	{
+		send = true;
+		if (len >= HDLC_BUFFER_SIZE-3) {
+			cr_lf = true;
+		} else {
+			wpan->tx_hdlc_block->buffer[wpan->tx_hdlc_block->length++] = '\r';
+			wpan->tx_hdlc_block->buffer[wpan->tx_hdlc_block->length++] = '\n';
+		}
+	} else {
+		wpan->tx_hdlc_block->buffer[wpan->tx_hdlc_block->length++] = c;
+		if (len >= HDLC_BUFFER_SIZE-2) {
+			send = true;
+		}
+	}
+
+	if (send) {
+		k_fifo_put(&wpan->tx_queue, wpan->tx_hdlc_block);
+		wpan->tx_hdlc_block = NULL;
+
+		if (cr_lf) {
+			if (k_mem_slab_alloc(&hdlc_slab, (void *) &wpan->tx_hdlc_block, K_NO_WAIT)) {
+				wpan->tx_hdlc_block = NULL;
+				return -ENOMEM;
+			} else {
+				wpan->tx_hdlc_block->address = ADDRESS_CDC;
+			}
+
+			wpan->tx_hdlc_block->buffer[wpan->tx_hdlc_block->length++] = '\r';
+			wpan->tx_hdlc_block->buffer[wpan->tx_hdlc_block->length++] = '\n';
+
+			k_fifo_put(&wpan->tx_queue, wpan->tx_hdlc_block);
+			wpan->tx_hdlc_block = NULL;
+		}
+	}
+
+	return c;
+}
+#endif
+
+/**
+ * @brief Initialize the console/debug port
+ * @return 0 if successful, otherwise failed.
+ */
+static int wpanusb_console_init(const struct device *arg)
+{
+	ARG_UNUSED(arg);
+	__stdout_hook_install(wpanusb_console_out);
+	__printk_hook_install(wpanusb_console_out);
+
+	return 0;
+}
+
+/* UART console initializes after the UART device itself */
+SYS_INIT(wpanusb_console_init,
+	 APPLICATION,
+	 CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
