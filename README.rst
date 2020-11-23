@@ -1,6 +1,6 @@
 .. wpanusb_bc:
 
-wpanusb for Beagle Connect
+wpanusb for BeagleConnect Freedom
 ##############
 
 Overview
@@ -15,14 +15,14 @@ implemented using the Linux SoftMAC driver.
 Requirements
 ************
 
-- a Beagle Connect board connected via USB to a Linux host
-- wpanusb Linux kernel driver (in the process of being open sourced)
+- a BeagleConnect Freedom board connected via USB to a Linux host
+- wpanusb Linux kernel driver https://github.com/statropy/wpanusb
 - wpan-tools (available for all Linux distributions)
 
 Building
 ********
 
-Clone and update the submodule for the BeagleConnect board definition
+Clone and update the submodule for the BeagleConnect Freedom board definition
 
 .. code-block:: console
 
@@ -37,20 +37,20 @@ Build the wpanusb_bc project for 2.4GHz:
 
 .. code-block:: console
 
-    west build -b beagle_connect ~/wpanusb_bc
+    west build -b beagleconnect_freedom ~/wpanusb_bc -- -DDTC_OVERLAY_FILE=beagleconnect_freedom.overlay
 
 Or build the wpanusb_bc project for Sub GHz:
 
 .. code-block:: console
 
-    west build -b beagle_connect ~/wpanusb_bc -- -DOVERLAY_CONFIG=overlay-subghz.conf
+    west build -b beagleconnect_freedom ~/wpanusb_bc -- -DOVERLAY_CONFIG=overlay-subghz.conf -DDTC_OVERLAY_FILE=beagleconnect_freedom.overlay
 
 A build directory can be specified with the -d option
 
 Updating with west flash
 ************************
 
-To program the BeagleConnect with west flash the MSP430 needs to be loaded with the 
+To program the BeagleConnect Freedom with west flash the MSP430 needs to be loaded with the 
 master branch of https://github.com/statropy/msp430F55xx_usb_uart_bridge. See 
 https://github.com/statropy/msp430F55xx_usb_uart_bridge/blob/master/README.md for
 instructions on building and programming the MSP430.
