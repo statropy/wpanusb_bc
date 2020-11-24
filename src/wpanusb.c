@@ -32,14 +32,21 @@ LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_WRN);
 #define PIN1	DT_GPIO_PIN(LED1_NODE, gpios)
 #define FLAGS1	DT_GPIO_FLAGS(LED1_NODE, gpios)
 
+#define GPIO15_NODE	DT_ALIAS(gpio15)
+#define GPIO15		DT_GPIO_LABEL(GPIO15_NODE, gpios)
+#define PIN15		DT_GPIO_PIN(GPIO15_NODE, gpios)
+#define FLAGS15		DT_GPIO_FLAGS(GPIO15_NODE, gpios)
+
 static const struct device *dev_led0;
 static const struct device *dev_led1;
+static const struct device *dev_gpio15;
 
 #include "wpanusb.h"
 
 #define ADDRESS_CTRL    0x01
 #define ADDRESS_WPAN    0x03
 #define ADDRESS_CDC     0x05
+#define ADDRESS_HW      0x41
 
 #define HDLC_FRAME      0x7E
 #define HDLC_ESC        0x7D
@@ -51,6 +58,7 @@ static const struct device *dev_led1;
 struct hdlc_block {
 	void *fifo_reserved;
 	uint8_t address;
+	uint8_t ctrl;
 	uint8_t length;
 	uint8_t buffer[HDLC_BUFFER_SIZE];
 };
@@ -205,10 +213,10 @@ static void block_out(struct wpan_driver_context *wpan, struct hdlc_block *block
 	uart_poll_out(wpan->uart_dev, HDLC_FRAME);
 	uart_poll_out_crc(wpan->uart_dev, block_ptr->address, &crc);
 	
-	if (block_ptr->address == ADDRESS_WPAN) {
+	if (block_ptr->ctrl == 0) {
 		uart_poll_out_crc(wpan->uart_dev, wpan->hdlc_send_seq << 1, &crc);
 	} else {
-		uart_poll_out_crc(wpan->uart_dev, 0x03, &crc);
+		uart_poll_out_crc(wpan->uart_dev, block_ptr->ctrl, &crc);
 	}
 	
 	for(int i=0; i<block_ptr->length; i++) {
@@ -221,6 +229,30 @@ static void block_out(struct wpan_driver_context *wpan, struct hdlc_block *block
 	uart_poll_out(wpan->uart_dev, HDLC_FRAME);
 }
 
+static void init_hdlc(struct wpan_driver_context *wpan)
+{
+	struct hdlc_block block;
+	block.address = ADDRESS_HW;
+	block.length = 0;
+	block.ctrl = 0;
+
+	while(1) {
+		block_out(wpan, &block);
+		if (k_sem_take(&hdlc_sem, K_MSEC(100))) {
+			//pulse the BOOT line
+			gpio_pin_set(dev_gpio15, PIN15, 0);
+			k_msleep(100);
+			gpio_pin_set(dev_gpio15, PIN15, 1);
+			k_msleep(500);
+			LOG_ERR("RETRY HDLC INIT");
+		} else {
+			LOG_INF("HDLC Ready");
+			wpan->hdlc_rx_send_seq = 1;
+			return;
+		}
+	}
+}
+
 static void tx_thread(void *p1)
 {
 	struct wpan_driver_context *wpan = p1;
@@ -228,6 +260,8 @@ static void tx_thread(void *p1)
 	struct hdlc_block debug_block;
 
 	debug_block.address = ADDRESS_CDC;
+
+	init_hdlc(wpan);
 
 	while(1) {
 		block_ptr = k_fifo_get(&wpan->tx_queue, K_FOREVER);
@@ -243,7 +277,7 @@ static void tx_thread(void *p1)
 		do {
 			block_out(wpan, block_ptr);
 
-			if (block_ptr->address == ADDRESS_WPAN) {
+			if (block_ptr->ctrl == 0) {
 				if (k_sem_take(&hdlc_sem, K_MSEC(wait_time))) {
 					if (retries++ < 3) {
 						LOG_DBG("I-Frame Retry");
@@ -255,9 +289,11 @@ static void tx_thread(void *p1)
 						block_pending = 1;
 					} else {
 						LOG_ERR("No ACK, Drop Packet");
+						block_pending = 0;
 					}
 				} else {
 					wpan->hdlc_rx_send_seq = (wpan->hdlc_rx_send_seq + 1) & 0x07;
+					block_pending = 0;
 				}
 			}
 		} while (block_pending);
@@ -315,6 +351,7 @@ static int tx(struct wpan_driver_context *wpan)
 	block_ptr->buffer[0] = seq;
 	block_ptr->length = 1;
 	block_ptr->address = ADDRESS_WPAN;
+	block_ptr->ctrl = 0;
 
 	k_fifo_put(&wpan->tx_queue, block_ptr);
 
@@ -362,6 +399,7 @@ int net_recv_data(struct net_if *iface, struct net_pkt *rx_pkt)
 	}
 
 	block_ptr->address = ADDRESS_WPAN;
+	block_ptr->ctrl = 0;
 
 	LOG_DBG("Alloc RX: %p, u: %d len: %d (%d)", block_ptr, 
 		k_mem_slab_num_used_get(&hdlc_slab), len+2, block_ptr->length);
@@ -558,15 +596,15 @@ void main(void)
 	struct wpan_driver_context *wpan = &wpan_context_data;
 	dev_led0 = device_get_binding(LED0);
 	dev_led1 = device_get_binding(LED1);
+	dev_gpio15 = device_get_binding(GPIO15);
 
 	gpio_pin_configure(dev_led0, PIN0, GPIO_OUTPUT_INACTIVE | FLAGS0);
 	gpio_pin_configure(dev_led1, PIN1, GPIO_OUTPUT_INACTIVE | FLAGS1);
+	gpio_pin_configure(dev_gpio15, PIN15, GPIO_OUTPUT_ACTIVE | FLAGS15);
 
 	LOG_INF("Starting wpanusb");
 
 	net_pkt_init();
-
-	init_tx_queue(wpan);
 
 	ring_buf_init(&wpan->rx_ringbuf, sizeof(wpan->rx_buf), wpan->rx_buf);
 	k_work_init(&wpan->cb_work, wpan_isr_cb_work);
@@ -581,6 +619,9 @@ void main(void)
 		LOG_ERR("Cannot get UART");
 		return;
 	}
+
+	init_tx_queue(wpan);
+
 	uart_irq_callback_user_data_set(wpan->uart_dev, wpan_isr_uart, wpan);
 	uart_irq_rx_enable(wpan->uart_dev);
 
@@ -611,6 +652,7 @@ static int wpanusb_console_out(int c)
 		} else {
 			wpan->tx_hdlc_block->length = 0;
 			wpan->tx_hdlc_block->address = ADDRESS_CDC;
+			wpan->tx_hdlc_block->ctrl = 0x03;
 		}
 	}
 
