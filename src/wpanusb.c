@@ -600,7 +600,8 @@ void main(void)
 
 	gpio_pin_configure(dev_led0, PIN0, GPIO_OUTPUT_INACTIVE | FLAGS0);
 	gpio_pin_configure(dev_led1, PIN1, GPIO_OUTPUT_INACTIVE | FLAGS1);
-	gpio_pin_configure(dev_gpio15, PIN15, GPIO_OUTPUT_ACTIVE | FLAGS15);
+	/* Increase drive-strength to overcome strong pull-up */
+	gpio_pin_configure(dev_gpio15, PIN15, GPIO_OUTPUT_ACTIVE| GPIO_DS_ALT_LOW | FLAGS15);
 
 	LOG_INF("Starting wpanusb");
 
