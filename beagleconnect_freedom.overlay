@@ -1,8 +1,16 @@
 / {
+    aliases {
+        gpio15 = &gpio_hdlc;
+    };
     chosen {
-        zephyr,sram = &sram0;
-        zephyr,flash = &flash0;
         zephyr,console = &uart1;
         zephyr,shell-uart = &uart1;
+    };
+    leds {
+        compatible = "gpio-leds";
+        gpio_hdlc: gpio_15 {
+            label = "GPIO 15";
+            gpios = <&gpio0 15 GPIO_ACTIVE_LOW>;
+        };
     };
 };
