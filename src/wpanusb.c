@@ -7,7 +7,7 @@
 
 #define LOG_LEVEL CONFIG_USB_DEVICE_LOG_LEVEL
 #include <logging/log.h>
-LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_WRN);
+LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_INF);
 
 #include <net/buf.h>
 #include <net/ieee802154_radio.h>
@@ -68,7 +68,6 @@ K_THREAD_STACK_DEFINE(tx_stack, CONFIG_WPAN_TX_STACK_SIZE);
 K_MEM_SLAB_DEFINE(hdlc_slab, sizeof(struct hdlc_block), CONFIG_WPANUSB_HDLC_NUM_BLOCKS, 4);
 K_SEM_DEFINE(hdlc_sem, 0, 1);
 
-
 struct wpan_driver_context {
 	const struct device *uart_dev;
 
@@ -113,8 +112,7 @@ static int set_channel(struct wpan_driver_context *wpan)
 
 	wpan->channel.page = req->page;
 	wpan->channel.channel = req->channel;
-	LOG_DBG("page %u channel %u", wpan->channel.page, wpan->channel.channel);
-
+	LOG_INF("page %u channel %u", wpan->channel.page, wpan->channel.channel);
 	return wpan->radio_api->set_channel(wpan->ieee802154_dev, req->channel);
 }
 
@@ -128,7 +126,7 @@ static int set_ieee_addr(struct wpan_driver_context *wpan)
 
 		filter.ieee_addr = (uint8_t *)&req->ieee_addr;
 
-		LOG_DBG("%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x", 
+		LOG_INF("%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x", 
 			filter.ieee_addr[0], filter.ieee_addr[1], filter.ieee_addr[2], filter.ieee_addr[3], 
 			filter.ieee_addr[4], filter.ieee_addr[5], filter.ieee_addr[6], filter.ieee_addr[7]);
 
@@ -144,7 +142,7 @@ static int set_short_addr(struct wpan_driver_context *wpan)
 {
 	struct set_short_addr *req = (struct set_short_addr *)&wpan->rx_buffer[10];
 
-	LOG_DBG("%04X", req->short_addr);
+	LOG_INF("short addr : %04X", req->short_addr);
 
 	if (IEEE802154_HW_FILTER &
 		wpan->radio_api->get_capabilities(wpan->ieee802154_dev)) {
@@ -164,7 +162,7 @@ static int set_pan_id(struct wpan_driver_context *wpan)
 {
 	struct set_pan_id *req = (struct set_pan_id *)&wpan->rx_buffer[10];
 	
-	LOG_DBG("%04X", req->pan_id);
+	LOG_INF("pan id : %04X", req->pan_id);
 
 	if (IEEE802154_HW_FILTER &
 		wpan->radio_api->get_capabilities(wpan->ieee802154_dev)) {
@@ -177,6 +175,22 @@ static int set_pan_id(struct wpan_driver_context *wpan)
 					 &filter);
 	}
 
+	return 0;
+}
+
+static int get_supported_channels(struct wpan_driver_context *wpan)
+{	struct hdlc_block *block_ptr;
+	uint32_t valid_channels = CONFIG_WPANUSB_DEVICE_VALID_CHANNELS;
+
+	if (k_mem_slab_alloc(&hdlc_slab, (void**)&block_ptr, K_NO_WAIT)) {
+		LOG_ERR("RX No Mem");
+		return -ENOMEM;
+	}
+	block_ptr->address = ADDRESS_WPAN;
+	block_ptr->ctrl = 1;
+	block_ptr->length = sizeof(uint32_t);
+	memcpy(block_ptr->buffer, (char*)&valid_channels, sizeof(uint32_t));
+	k_fifo_put(&wpan->tx_queue, block_ptr);
 	return 0;
 }
 
@@ -458,6 +472,9 @@ static void wpan_process_ctrl_frame(struct wpan_driver_context *wpan)
 		break;
 	case SET_PAN_ID:
 		ret = set_pan_id(wpan);
+		break;
+	case GET_SUPPORTED_CHANNELS:
+		ret = get_supported_channels(wpan);
 		break;
 	default:
 		LOG_ERR("%x: Not handled for now", cmd);
