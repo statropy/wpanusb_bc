@@ -53,6 +53,12 @@ config WPANUSB_CONSOLE
 	help
 	  Enable this option to use WPANUSB for console.
 
+config WPANUSB_DEVICE_VALID_CHANNELS
+	hex "valid IEEE802154 channels bitmap"
+	default 0x07FFF800
+	help
+	  bitmap indiciating valid IEEE802154 channels.
+
 config WPANUSB_HDLC_NUM_BLOCKS
 	int "Number of message blocks to reserve"
 	default 50
