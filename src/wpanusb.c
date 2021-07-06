@@ -32,14 +32,14 @@ LOG_MODULE_REGISTER(wpanusb_bc, LOG_LEVEL_INF);
 #define PIN1	DT_GPIO_PIN(LED1_NODE, gpios)
 #define FLAGS1	DT_GPIO_FLAGS(LED1_NODE, gpios)
 
-#define GPIO15_NODE	DT_ALIAS(gpio15)
-#define GPIO15		DT_GPIO_LABEL(GPIO15_NODE, gpios)
-#define PIN15		DT_GPIO_PIN(GPIO15_NODE, gpios)
-#define FLAGS15		DT_GPIO_FLAGS(GPIO15_NODE, gpios)
+#define SW0_NODE		DT_ALIAS(sw0)
+#define SW0_GPIO_LABEL	DT_GPIO_LABEL(SW0_NODE, gpios)
+#define SW0_GPIO_PIN	DT_GPIO_PIN(SW0_NODE, gpios)
+#define SW0_GPIO_FLAGS	DT_GPIO_FLAGS(SW0_NODE, gpios)
 
 static const struct device *dev_led0;
 static const struct device *dev_led1;
-static const struct device *dev_gpio15;
+static const struct device *dev_sw0;
 
 #include "wpanusb.h"
 
@@ -254,9 +254,9 @@ static void init_hdlc(struct wpan_driver_context *wpan)
 		block_out(wpan, &block);
 		if (k_sem_take(&hdlc_sem, K_MSEC(100))) {
 			//pulse the BOOT line
-			gpio_pin_set(dev_gpio15, PIN15, 0);
+			gpio_pin_set(dev_sw0, SW0_GPIO_PIN, 0);
 			k_msleep(100);
-			gpio_pin_set(dev_gpio15, PIN15, 1);
+			gpio_pin_set(dev_sw0, SW0_GPIO_PIN, 1);
 			k_msleep(500);
 			LOG_ERR("RETRY HDLC INIT");
 		} else {
@@ -613,12 +613,12 @@ void main(void)
 	struct wpan_driver_context *wpan = &wpan_context_data;
 	dev_led0 = device_get_binding(LED0);
 	dev_led1 = device_get_binding(LED1);
-	dev_gpio15 = device_get_binding(GPIO15);
+	dev_sw0 = device_get_binding(SW0_GPIO_LABEL);
 
 	gpio_pin_configure(dev_led0, PIN0, GPIO_OUTPUT_INACTIVE | FLAGS0);
 	gpio_pin_configure(dev_led1, PIN1, GPIO_OUTPUT_INACTIVE | FLAGS1);
 	/* Increase drive-strength to overcome strong pull-up */
-	gpio_pin_configure(dev_gpio15, PIN15, GPIO_OUTPUT_ACTIVE | GPIO_DS_ALT_LOW | GPIO_DS_ALT_HIGH | FLAGS15);
+	gpio_pin_configure(dev_sw0, SW0_GPIO_PIN, GPIO_OUTPUT_ACTIVE | GPIO_DS_ALT_LOW | GPIO_DS_ALT_HIGH | SW0_GPIO_FLAGS);
 
 	LOG_INF("Starting wpanusb");
 
